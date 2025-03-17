@@ -8,6 +8,8 @@ let startTime;
 let currentWorkspace;
 let timeSpentPerWorkspace = {};
 let projects = [];
+let activeProject = null;
+let timerInterval = null;
 
 // Fonction pour charger les projets
 async function loadProjects() {
@@ -33,6 +35,26 @@ async function saveProjects() {
   }
 }
 
+// Fonction pour trouver ou créer un projet
+async function findOrCreateProject(gitUrl, workspaceName) {
+  if (!gitUrl) return null;
+
+  let project = projects.find((p) => p.gitUrl === gitUrl);
+
+  if (!project) {
+    project = {
+      gitUrl: gitUrl,
+      name: workspaceName,
+      timeSpent: 0,
+      lastOpened: new Date().toISOString(),
+    };
+    projects.push(project);
+    await saveProjects();
+  }
+
+  return project;
+}
+
 // Fonction pour mettre à jour le temps d'un projet
 async function updateProjectTime(gitUrl, timeSpent) {
   try {
@@ -41,8 +63,26 @@ async function updateProjectTime(gitUrl, timeSpent) {
     const minutes = Math.floor(timeSpent % 60);
     const formattedTime = `${hours} h ${minutes}min`;
 
+    // Mettre à jour le projet local
+    const projectIndex = projects.findIndex((p) => p.gitUrl === gitUrl);
+    if (projectIndex >= 0) {
+      projects[projectIndex].timeSpent = timeSpent;
+      projects[projectIndex].lastOpened = new Date().toISOString();
+    } else {
+      // Ajouter un nouveau projet
+      projects.push({
+        gitUrl: gitUrl,
+        name: currentWorkspace,
+        timeSpent: timeSpent,
+        lastOpened: new Date().toISOString(),
+      });
+    }
+
+    // Sauvegarder les projets
+    await saveProjects();
+
     // Envoyer au portfolio
-    await axios.post("http://localhost:5173/api/projects/update", {
+    await axios.post("http://localhost:3001/api/projects/update", {
       github: gitUrl,
       hoursSpent: formattedTime,
       lastUpdated: new Date().toISOString(),
@@ -52,6 +92,23 @@ async function updateProjectTime(gitUrl, timeSpent) {
   } catch (error) {
     console.error("Erreur lors de la mise à jour du portfolio:", error);
   }
+}
+
+// Fonction pour mettre à jour le compteur en temps réel
+function updateRealTimeCounter() {
+  if (!activeProject) return;
+
+  const now = new Date();
+  const elapsedMinutes = Math.floor(
+    (now.getTime() - startTime.getTime()) / 1000 / 60
+  );
+  const totalTime = activeProject.timeSpent + elapsedMinutes;
+
+  // Format: "Session: 1h 23min | Total: 5h 45min"
+  const sessionTime = formatTime(elapsedMinutes);
+  const totalTimeFormatted = formatTime(totalTime);
+
+  statusBarItem.text = `📁 ${currentWorkspace} | Session: ${sessionTime} | Total: ${totalTimeFormatted}`;
 }
 
 function activate(context) {
@@ -81,17 +138,34 @@ function activate(context) {
     timeSpentPerWorkspace[currentWorkspace] = 0;
   }
 
+  // Initialiser le projet actif
+  (async () => {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    const workspacePath = workspaceFolders
+      ? workspaceFolders[0].uri.fsPath
+      : null;
+    const gitUrl = await getGitUrl(workspacePath);
+
+    if (gitUrl) {
+      activeProject = await findOrCreateProject(gitUrl, currentWorkspace);
+      updateRealTimeCounter();
+
+      // Démarrer le compteur en temps réel
+      timerInterval = setInterval(updateRealTimeCounter, 10000); // Mise à jour toutes les 10 secondes
+    }
+  })();
+
   // Listener pour détecter l'enregistrement d'un fichier
   vscode.workspace.onDidSaveTextDocument((document) => {
     const fileName = document.fileName;
     const workspaceName = vscode.workspace.name || "No Workspace";
 
-    // Si vous devez utiliser Buffer, utilisez les nouvelles méthodes
-
     // Mise à jour du StatusBarItem lors de l'enregistrement
-    statusBarItem.text = `📁 ${workspaceName} | Fichier enregistré : ${fileName
-      .split("/")
-      .pop()}`;
+    if (!activeProject) {
+      statusBarItem.text = `📁 ${workspaceName} | Fichier enregistré : ${fileName
+        .split("/")
+        .pop()}`;
+    }
     console.log(
       `Fichier enregistré : ${fileName} dans l'espace : ${workspaceName}`
     );
@@ -100,22 +174,37 @@ function activate(context) {
     sendStatusToAPI(workspaceName, fileName);
   });
 
-  // Sauvegarder les projets au démarrage
-  saveProjects();
-
   // Listener pour détecter le changement de dossier racine
-  vscode.workspace.onDidChangeWorkspaceFolders(() => {
+  vscode.workspace.onDidChangeWorkspaceFolders(async () => {
     const newWorkspace = vscode.workspace.name || "No Workspace";
     if (newWorkspace !== currentWorkspace) {
-      const endTime = new Date();
-      const timeSpent = (endTime.getTime() - startTime.getTime()) / 1000 / 60; // en minutes
-      timeSpentPerWorkspace[currentWorkspace] += timeSpent;
-      sendTimeToAPI(currentWorkspace, timeSpentPerWorkspace[currentWorkspace]);
+      // Sauvegarder le temps du projet actuel
+      if (activeProject) {
+        const endTime = new Date();
+        const timeSpent = (endTime.getTime() - startTime.getTime()) / 1000 / 60; // en minutes
+        activeProject.timeSpent += timeSpent;
+        await saveProjects();
+        await updateProjectTime(activeProject.gitUrl, activeProject.timeSpent);
+      }
+
+      // Réinitialiser pour le nouveau workspace
       currentWorkspace = newWorkspace;
       startTime = new Date();
-      if (!timeSpentPerWorkspace[currentWorkspace]) {
-        timeSpentPerWorkspace[currentWorkspace] = 0;
+
+      // Initialiser le nouveau projet actif
+      const workspaceFolders = vscode.workspace.workspaceFolders;
+      const workspacePath = workspaceFolders
+        ? workspaceFolders[0].uri.fsPath
+        : null;
+      const gitUrl = await getGitUrl(workspacePath);
+
+      if (gitUrl) {
+        activeProject = await findOrCreateProject(gitUrl, currentWorkspace);
+      } else {
+        activeProject = null;
       }
+
+      updateRealTimeCounter();
     }
   });
 
@@ -123,10 +212,20 @@ function activate(context) {
 }
 
 function deactivate() {
-  const endTime = new Date();
-  const timeSpent = (endTime.getTime() - startTime.getTime()) / 1000 / 60; // en minutes
-  timeSpentPerWorkspace[currentWorkspace] += timeSpent;
-  sendTimeToAPI(currentWorkspace, timeSpentPerWorkspace[currentWorkspace]);
+  // Arrêter le compteur en temps réel
+  if (timerInterval) {
+    clearInterval(timerInterval);
+  }
+
+  // Sauvegarder le temps du projet actuel
+  if (activeProject) {
+    const endTime = new Date();
+    const timeSpent = (endTime.getTime() - startTime.getTime()) / 1000 / 60; // en minutes
+    activeProject.timeSpent += timeSpent;
+    saveProjects();
+    updateProjectTime(activeProject.gitUrl, activeProject.timeSpent);
+  }
+
   console.log("Extension désactivée");
 }
 
@@ -139,48 +238,32 @@ async function sendStatusToAPI(workspace, file) {
       : null;
     const gitUrl = await getGitUrl(workspacePath);
 
-    await axios.post("http://localhost:5173/status", {
+    // Calculer le temps écoulé
+    const now = new Date();
+    const elapsedMinutes = Math.floor(
+      (now.getTime() - startTime.getTime()) / 1000 / 60
+    );
+    const sessionTime = formatTime(elapsedMinutes);
+
+    await axios.post("http://localhost:3001/status", {
       workspace,
       file,
       gitUrl,
       timestamp: new Date().toISOString(),
+      sessionTime: sessionTime, // Ajout du temps de session
+      totalTime: activeProject
+        ? formatTime(activeProject.timeSpent + elapsedMinutes)
+        : "0h 0min",
     });
+
     console.log("Données envoyées à l'API avec succès !");
-    statusBarItem.text = `📁 ${workspace} | Git: ${gitUrl || "No Git URL"}`;
+    statusBarItem.text = `📁 ${workspace} | Session: ${sessionTime}`;
   } catch (error) {
     console.error(
       "Erreur lors de l'envoi des données à l'API :",
       error.message
     );
     statusBarItem.text = "❌ Erreur lors de l'envoi des données à l'API";
-  }
-}
-
-// Fonction pour envoyer le temps passé à l'API
-async function sendTimeToAPI(workspace, timeSpent) {
-  try {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    const workspacePath = workspaceFolders
-      ? workspaceFolders[0].uri.fsPath
-      : null;
-    const gitUrl = await getGitUrl(workspacePath);
-    const formattedTime = formatTime(timeSpent);
-
-    await axios.post("http://localhost:5173/time", {
-      workspace,
-      timeSpent: formattedTime,
-      gitUrl,
-      timestamp: new Date().toISOString(),
-    });
-
-    if (gitUrl) {
-      await updateProjectTime(gitUrl, timeSpent);
-    }
-
-    console.log("Temps passé envoyé à l'API avec succès !");
-  } catch (error) {
-    console.error("Erreur lors de l'envoi du temps passé à l'API :", error);
-    statusBarItem.text = "❌ Erreur lors de l'envoi du temps passé à l'API";
   }
 }
 
