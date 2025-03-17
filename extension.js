@@ -244,17 +244,22 @@ async function sendStatusToAPI(workspace, file) {
       (now.getTime() - startTime.getTime()) / 1000 / 60
     );
     const sessionTime = formatTime(elapsedMinutes);
+    const totalTime = activeProject
+      ? formatTime(activeProject.timeSpent + elapsedMinutes)
+      : "0min";
 
-    await axios.post("http://localhost:3001/status", {
+    const statusData = {
       workspace,
       file,
       gitUrl,
       timestamp: new Date().toISOString(),
-      sessionTime: sessionTime, // Ajout du temps de session
-      totalTime: activeProject
-        ? formatTime(activeProject.timeSpent + elapsedMinutes)
-        : "0h 0min",
-    });
+      sessionTime,
+      totalTime, // Make sure this is sent
+    };
+
+    console.log("Sending status data:", statusData); // Debug log
+
+    await axios.post("http://localhost:3001/status", statusData);
 
     console.log("Données envoyées à l'API avec succès !");
     statusBarItem.text = `📁 ${workspace} | Session: ${sessionTime}`;
